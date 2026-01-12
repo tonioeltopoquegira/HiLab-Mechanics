@@ -42,21 +42,30 @@ from neural_structural_optimization import topo_physics
 
 
 CONFIG = {
-    "decoder_checkpoint": "models/vitvae_decoder_thaw2.pt",
+    "decoder_checkpoint": "models/vitvae_decoder_thaw1_latent16.pt",
     "latent_dim": 16,
     "bounds": (-10.0, 10.0),
     "max_trials": 100,
     "sobol_steps": 5,
+    "binarize_threshold": 0.5,
     "save_dir": "bo_results",
 }
 
 
-def load_decoder_from_checkpoint(path: str, latent_dim: int):
+def load_decoder_from_checkpoint(path: str, latent_dim: int = None):
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     ck = torch.load(path, map_location="cpu")
     meta = ck.get("meta", {})
     state = ck.get("state", ck)
+
+    # If latent_dim not provided, try to read from checkpoint meta
+    if latent_dim is None:
+        if "latent_dim" in meta:
+            latent_dim = int(meta["latent_dim"])
+        else:
+            # fallback to default in CONFIG
+            latent_dim = int(CONFIG.get("latent_dim", 16))
 
     model = ViTVAE(latent_dim=latent_dim)
     # load only matching keys
@@ -120,6 +129,11 @@ def resize_for_physics(gray: np.ndarray, nelx: int, nely: int):
     return arr
 
 
+def binarize_array(arr: np.ndarray, threshold: float = 0.5):
+    """Simple threshold binarization returning float array of 0/1."""
+    return (arr >= threshold).astype(np.float32)
+
+
 def evaluate_compliance(design_arr: np.ndarray, args=None):
     if args is None:
         args = topo_physics.default_args()
@@ -133,17 +147,29 @@ def run_bo():
     os.makedirs(CONFIG['save_dir'], exist_ok=True)
     start_time = time.time()
 
-    # Load decoder model
-    decoder = load_decoder_from_checkpoint(CONFIG['decoder_checkpoint'], CONFIG['latent_dim'])
+    # Inspect decoder checkpoint to detect latent_dim if present in metadata
+    try:
+        if os.path.exists(CONFIG['decoder_checkpoint']):
+            ck_peek = torch.load(CONFIG['decoder_checkpoint'], map_location='cpu')
+            meta_peek = ck_peek.get('meta', {})
+            if 'latent_dim' in meta_peek:
+                CONFIG['latent_dim'] = int(meta_peek['latent_dim'])
+    except Exception:
+        # ignore peek failures and fall back to CONFIG value
+        pass
+
+    # Load decoder model (will also fall back to CONFIG latent_dim if checkpoint lacks meta)
+    decoder = load_decoder_from_checkpoint(CONFIG['decoder_checkpoint'], CONFIG.get('latent_dim', None))
 
     # Create Ax client
     client = AxClient()
-    # define 16 continuous parameters
+    # define latent-dim continuous parameters based on detected latent size
+    latent_dim = int(CONFIG['latent_dim'])
     params = [{
         "name": f"x{i}",
         "type": "range",
         "bounds": [CONFIG['bounds'][0], CONFIG['bounds'][1]],
-    } for i in range(CONFIG['latent_dim'])]
+    } for i in range(latent_dim)]
 
     # Create experiment with robust handling for different Ax versions.
     from inspect import signature
@@ -189,8 +215,10 @@ def run_bo():
         # parameters: dict of name->value
         z = np.array([float(parameters[f"x{i}"]) for i in range(CONFIG['latent_dim'])], dtype=np.float32)
         t0 = time.time()
+        # decode latent -> continuous design, then binarize before evaluating compliance
         design = latent_to_design(decoder, z)
-        c = evaluate_compliance(design)
+        bin_design = binarize_array(design, threshold=float(CONFIG.get('binarize_threshold', 0.5)))
+        c = evaluate_compliance(bin_design)
         elapsed = time.time() - t0
 
         client.complete_trial(trial_index=trial_index, raw_data={"compliance": (c, 0.0)})
@@ -215,6 +243,7 @@ def run_bo():
         "timestamp": datetime.now().isoformat(),
         "decoder_ckpt": CONFIG['decoder_checkpoint'],
         "best_params": best[1] if best is not None else None,
+        "latent_dim": int(CONFIG.get('latent_dim', 16)),
     }
     out_fname = os.path.join(CONFIG['save_dir'], f"bo_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
     with open(out_fname, 'w') as fh:
@@ -231,19 +260,24 @@ def run_bo():
                 nely = int(args['nely'])
                 nelx = int(args['nelx'])
                 phys = resize_for_physics(gray, nelx, nely)
+                # also produce a binarized density used for compliance
+                phys_bin = binarize_array(phys, threshold=float(CONFIG.get('binarize_threshold', 0.5)))
 
                 base = os.path.splitext(os.path.basename(out_fname))[0]
                 rgb_path = os.path.join(CONFIG['save_dir'], base + '_best_recon_rgb.png')
                 gray_path = os.path.join(CONFIG['save_dir'], base + '_best_recon_gray.png')
                 phys_path = os.path.join(CONFIG['save_dir'], base + '_best_physics_density.png')
+                phys_bin_path = os.path.join(CONFIG['save_dir'], base + '_best_physics_density_bin.png')
 
                 Image.fromarray((rgb * 255).astype(np.uint8)).save(rgb_path)
                 Image.fromarray((gray * 255).astype(np.uint8)).save(gray_path)
                 Image.fromarray((phys * 255).astype(np.uint8)).save(phys_path)
+                Image.fromarray((phys_bin * 255).astype(np.uint8)).save(phys_bin_path)
 
                 print('Saved best reconstruction RGB:', rgb_path)
                 print('Saved best reconstruction gray:', gray_path)
                 print('Saved best physics density:', phys_path)
+                print('Saved best binarized physics density:', phys_bin_path)
             except Exception as e:
                 print('Failed to save best-images:', e)
     except Exception:
