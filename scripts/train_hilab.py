@@ -323,30 +323,42 @@ def run_one_epoch(model, loader, optimizer, criterion, device, train=True):
     avg_mse = running_mse / max(1, n_imgs)
     avg_psnr = running_psnr / max(1, n_imgs)
     return {"loss": avg_loss, "mse": avg_mse, "psnr": avg_psnr}
-def save_grid(imgs, path, nrow=4):
+def save_grid(imgs, path, nrow=4, rotate90: bool = False):
     """imgs: Tensor (B,3,H,W) in [0,1]"""
     b, c, h, w = imgs.shape
     ncol = nrow
     nrow = int(math.ceil(b / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(ncol*2, nrow*2))
+    # infer one image size after conversion to original layout to set figure aspect
+    if h == 128 and w == 256:
+        sample_h, sample_w = w, h  # original layout is (256,128) => (H_orig=W, W_orig=H)
+    else:
+        sample_h, sample_w = h, w
+    # each tile: base size 2 inches height; adjust width to keep aspect ratio
+    tile_h_in = 2.0
+    tile_w_in = tile_h_in * (sample_w / sample_h)
+    fig_w = ncol * tile_w_in
+    fig_h = nrow * tile_h_in
+    fig, axes = plt.subplots(nrow, ncol, figsize=(max(1.0, fig_w), max(1.0, fig_h)))
     axes = axes.flatten()
     for i in range(len(axes)):
         axes[i].axis("off")
         if i < b:
-            # If internal tensor uses the (3,128,256) layout (H=128, W=256),
-            # that corresponds to original images saved as (256,128,3) (NHWC).
-            # To display the original non-transposed orientation, invert the
-            # internal permutation by permuting (0,3,2,1) on the batch.
+            # Convert internal tensor (C,H,W) back to original saved layout (H_orig= W, W_orig= H, C)
+            # Our dataset originally produced NHWC images of shape (256,128,3) which were
+            # converted to NCHW (3,128,256). To show the original orientation we need
+            # to permute (2,1,0) -> (W,H,C) == (256,128,3).
             if h == 128 and w == 256:
-                # imgs[i] is (3,128,256) -> (256,128,3)
-                img = imgs[i].permute(1,2,0).cpu().numpy()
-                # Note: the code historically used a permute that swapped H/W;
-                # here we ensure we show the image in the original tall orientation.
+                img = imgs[i].permute(2, 1, 0).cpu().numpy()
             else:
-                img = imgs[i].permute(1,2,0).cpu().numpy()
-            axes[i].imshow(img)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150)
+                img = imgs[i].permute(1, 2, 0).cpu().numpy()
+            # Optionally rotate 90 degrees counter-clockwise for visualization
+            if rotate90:
+                import numpy as _np
+                img = _np.rot90(img, k=1)
+            axes[i].imshow(img, aspect='equal')
+    # Save without cropping the tiles
+    plt.subplots_adjust(wspace=0.05, hspace=0.05)
+    plt.savefig(path, dpi=150, bbox_inches='tight')
     plt.close()
 
 # =========================
@@ -406,6 +418,21 @@ def sweep_thaw_depths_with_loaders(
                     save_grid(recon, f"examples/recon_thaw{k}.png")
                     print(f"Saved examples: examples/input_thaw{k}.png, examples/recon_thaw{k}.png")
 
+            # Save model parameters for this thaw setting
+            os.makedirs("models", exist_ok=True)
+            full_path = os.path.join("models", f"vitvae_thaw{k}.pt")
+            try:
+                torch.save(model.state_dict(), full_path)
+                # Also save decoder-only weights for quick loading in downstream BO
+                decoder_path = os.path.join("models", f"vitvae_decoder_thaw{k}.pt")
+                dec_state = {kname: v for kname, v in model.state_dict().items() if kname.startswith("decoder") or kname.startswith("decoder_input")}
+                # include metadata
+                meta = {"latent_dim": latent_dim, "recon_size": (128, 256)}
+                torch.save({"meta": meta, "state": dec_state}, decoder_path)
+                print(f"Saved model state: {full_path} and decoder: {decoder_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to save model for thaw={k}: {e}")
+
         all_curves[k] = val_mse_curve
         agg = sum(val_mse_curve[-2:]) / 2.0 if len(val_mse_curve) >= 2 else val_mse_curve[-1]
         results.append({"thaw_blocks": k, "val_mse": agg})
@@ -456,7 +483,7 @@ if __name__ == "__main__":
     # --- Configuration: edit these paths to point to your image folders ---
     CONFIG = {
         # list of directories containing PNG/JPEG images for training
-        'train_dirs':['outputs/augmented/designs/mbb_beam_384x64_0.4-20260111-164330/images'],
+        'train_dirs':['outputs/augmented/designs/mbb_beam_384x64_0.4-20260111-164330'],
         # list of directories for validation / holdout
         'val_dirs': ['outputs/designs/mbb_beam_384x64_0.4-20260111-164330/images'],
         # desired in-memory image size: (width, height) for PIL resize
@@ -534,9 +561,9 @@ if __name__ == "__main__":
     results, curves = sweep_thaw_depths_with_loaders(
         train_loader, val_loader,
         thaw_depths=thaw_settings,
-        epochs_per_setting=15,
+        epochs_per_setting=20,
         latent_dim=16,
-        recon_type="mse",
-        kl_weight=0,
+        recon_type="bce",
+        kl_weight=1e-2,
         lr=1e-4,
     )
