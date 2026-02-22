@@ -2,6 +2,7 @@ import os
 import math
 import random
 from typing import List, Tuple, Dict
+from xml.parsers.expat import model
 
 import numpy as np
 import torch
@@ -134,6 +135,28 @@ class ViTVAE(nn.Module):
                 nn.BatchNorm2d(64), nn.ReLU(True),
 
                 nn.ConvTranspose2d(64, 3, kernel_size=4, stride=2, padding=1),     # (3, 128, 256)
+                nn.Sigmoid()
+            )
+
+        if size_decoder == "xlarge":
+            self.decoder_input = nn.Linear(latent_dim, 2048 * 4 * 8)  # seed (2048, 4, 8)
+
+            self.decoder = nn.Sequential(
+                nn.Unflatten(dim=1, unflattened_size=(2048, 4, 8)),  # (2048, 4, 8)
+
+                nn.ConvTranspose2d(2048, 1024, 4, 2, 1),  # (1024, 8, 16)
+                nn.BatchNorm2d(1024), nn.ReLU(True),
+
+                nn.ConvTranspose2d(1024, 512, 4, 2, 1),   # (512, 16, 32)
+                nn.BatchNorm2d(512), nn.ReLU(True),
+
+                nn.ConvTranspose2d(512, 256, 4, 2, 1),    # (256, 32, 64)
+                nn.BatchNorm2d(256), nn.ReLU(True),
+
+                nn.ConvTranspose2d(256, 128, 4, 2, 1),    # (128, 64, 128)
+                nn.BatchNorm2d(128), nn.ReLU(True),
+
+                nn.ConvTranspose2d(128, 3, 4, 2, 1),      # (3, 128, 256)
                 nn.Sigmoid()
             )
 
@@ -347,44 +370,65 @@ def make_optimizer(model):
 def run_one_epoch(model, loader, optimizer, criterion, device, train=True):
     model.train() if train else model.eval()
 
-    running_loss = 0.0
-    running_mse = 0.0
-    running_psnr = 0.0
+    total_loss = 0.0
+    total_mse_sum = 0.0
+    total_pixels = 0
+    total_kld = 0.0
     n_imgs = 0
 
     pbar = tqdm(loader, leave=False)
-    for batch in pbar:
-        if isinstance(batch, (list, tuple)) and len(batch) == 2:
-            imgs = batch[0]
-        else:
-            imgs = batch  # fallback
 
+    for batch in pbar:
+        imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
         imgs = imgs.to(device, non_blocking=True)
 
         if train:
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(train):
-            recon, mu, logvar = model(imgs)
-            loss, recon_mse, kld = criterion(recon, imgs, mu, logvar)
+            if train:
+                # stochastic
+                recon, mu, logvar = model(imgs)
+                loss, recon_loss, kld = criterion(recon, imgs, mu, logvar)
+            else:
+                # deterministic validation
+                mu, logvar = model.encode(imgs)
+                z = mu
+                recon = model.decode(z)
+
+                recon_loss = F.mse_loss(recon, imgs, reduction="mean")
+                kld = torch.zeros_like(recon_loss)
+                loss = recon_loss  # NO KL in validation
+
             if train:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
         bsz = imgs.size(0)
-        running_loss += loss.item() * bsz
-        batch_mse = F.mse_loss(recon, imgs, reduction="mean").item()
-        running_mse += batch_mse * bsz
-        running_psnr += psnr_from_mse(batch_mse) * bsz
+        total_loss += loss.item() * bsz
+        total_kld += kld.item() * bsz
+        total_mse_sum += F.mse_loss(recon, imgs, reduction="sum").item()
+        total_pixels += imgs.numel()
         n_imgs += bsz
 
-        pbar.set_description(f"{'Train' if train else 'Eval'} loss {loss.item():.4f} | MSE {batch_mse:.4f}")
+        pbar.set_description(
+            f"{'Train' if train else 'Eval'} "
+            f"MSE {recon_loss.item():.5f}"
+        )
 
-    avg_loss = running_loss / max(1, n_imgs)
-    avg_mse = running_mse / max(1, n_imgs)
-    avg_psnr = running_psnr / max(1, n_imgs)
-    return {"loss": avg_loss, "mse": avg_mse, "psnr": avg_psnr}
+    avg_loss = total_loss / n_imgs
+    avg_mse = total_mse_sum / total_pixels  # TRUE global MSE
+    avg_psnr = psnr_from_mse(avg_mse)
+
+    return {
+        "loss": avg_loss,
+        "mse": avg_mse,
+        "psnr": avg_psnr,
+        "kld": total_kld / n_imgs
+    }
+
+
 def save_grid(imgs, path, nrow=4, rotate90: bool = False):
     """imgs: Tensor (B,3,H,W) in [0,1]"""
     b, c, h, w = imgs.shape
@@ -496,7 +540,10 @@ def sweep_thaw_depths_with_loaders(
             val_metrics   = run_one_epoch(model, val_loader,   optimizer, criterion, device, train=False)
 
             print(f"Train: loss={train_metrics['loss']:.4f} | MSE={train_metrics['mse']:.6f} | PSNR={train_metrics['psnr']:.2f} dB")
-            print(f"Val  : loss={val_metrics['loss']:.4f} | MSE={val_metrics['mse']:.6f} | PSNR={val_metrics['psnr']:.2f} dB")
+            print(
+                f"Val  : MSE={val_metrics['mse']:.6f} | "
+                f"PSNR={val_metrics['psnr']:.2f} dB"
+            )
 
             val_mse_curve.append(val_metrics["mse"])
 
@@ -505,7 +552,8 @@ def sweep_thaw_depths_with_loaders(
                 with torch.no_grad():
                     imgs, _ = next(iter(val_loader))
                     imgs = imgs[:8].to(device)
-                    recon, _, _ = model(imgs)
+                    mu, _ = model.encode(imgs)
+                    recon = model.decode(mu)
 
                     # Here add the reconstruction new
                     os.makedirs("examples", exist_ok=True)
@@ -584,7 +632,7 @@ def reconstruction_check(model, output_file):
     print("Converted to NCHW for model:", orig_nchw.shape, "  (N,C,H,W)")
 
     # -------------------------
-    # Run model (same path as training: encode -> reparameterize -> decode)
+    # Run model (deterministic path: encode -> decode with z = mu)
     # -------------------------
     recons = []
     mus = []
@@ -592,10 +640,9 @@ def reconstruction_check(model, output_file):
     with torch.no_grad():
         for i in range(0, len(orig_nchw), 8):
             batch = orig_nchw[i:i+8]
-            # use the exact forward behavior from training:
-            # forward() does encode->reparam->decode, but call encode/reparam/decode explicitly for diagnostics
+            # Deterministic reconstruction: z = mu (no sampling)
             mu, logvar = model.encode(batch)
-            z = model.reparameterize(mu, logvar)
+            z = mu
             recon = model.decode(z)   # (B,3,128,256)
             recons.append(recon.cpu())
             mus.append(mu.cpu())
@@ -627,6 +674,7 @@ def reconstruction_check(model, output_file):
     recon_sq = stretch(recon_nhwc, target_height=128, target_width=256)
 
     save_side_by_side_2x4(orig_sq, recon_sq, output_file)
+    save_side_by_side_2x4(orig_sq, recon_sq, output_file.replace(".png", "_gray.png"), binarize=False)
 
     print("Saved comparison to:", output_file)
 
@@ -738,21 +786,16 @@ if __name__ == "__main__":
         normalize_from_uint8=CONFIG['normalize_from_uint8'],
     )
     
-    thaw_settings = [1]  # 2 = my best choice
+    
     init_model_path = CONFIG.get('init_model_path')
-    for thaw in thaw_settings:
-        print(f"Testing thaw setting {thaw} with 6 epochs...")
-        for latent_dim in [16]:
-            print(f"  Latent dim {latent_dim}...")
-            for decoder_size in ["medium"]:
-                print(f"    Decoder size {decoder_size}...")
-                results, curves = sweep_thaw_depths_with_loaders(
-                    train_loader, val_loader,
-                    thaw_depths=[thaw],
-                    epochs_per_setting=12,
-                    latent_dim=latent_dim,
-                    recon_type="mse",
-                    kl_weight=5e-3,
-                    size_decoder=decoder_size,
-                    init_model_path=init_model_path,
-                )
+    for thaw, decoder_size in zip([3, 2], ["large", "xlarge"]):
+        results, curves = sweep_thaw_depths_with_loaders(
+            train_loader, val_loader,
+            thaw_depths=[thaw],
+            epochs_per_setting=20,
+            latent_dim=16,
+            recon_type="mse",
+            kl_weight=5e-3,
+            size_decoder=decoder_size,
+            init_model_path=init_model_path,
+        )
