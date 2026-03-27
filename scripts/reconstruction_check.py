@@ -17,13 +17,13 @@ from PIL import Image
 import matplotlib.pyplot as plt
 
 # --- Config: adjust to your environment ---
-MODEL_PATH = "models/vitvae_thaw4_latent8_decodersizexlarge_20260311-235805.pt"   # full model (state_dict)
+MODEL_PATH = "models/vitvae_thaw2_latent16_decodersizexlarge_20260223-102323_GOOD_EPOCH15.pt"   # full model (state_dict)
 IMAGE_DIR  = "outputs/designs/mbb_beam_384x64_0.4-20260111-164330/images"
 OUT_DIR    = f"recon_check/{os.path.splitext(os.path.basename(MODEL_PATH))[0]}"  
 BATCH_SIZE = 8
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 RESIZE     = (128, 256)  # (width, height) used in training
-LATENT_DIM = 8     # must match what you trained
+LATENT_DIM = 16     # must match what you trained
 SIZE_DECODER = 'xlarge'
 
 os.makedirs(OUT_DIR, exist_ok=True)

@@ -4,3 +4,9 @@ bo_results
 models
 figures
 examples
+*.txt
+*.json
+*.png
+*.pdf
+*.pptx
+

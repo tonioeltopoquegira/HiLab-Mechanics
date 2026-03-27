@@ -43,15 +43,15 @@ def main():
     # Editable configuration dict — modify this block directly.
     CONFIG = {
         'output_dir': 'outputs/designs',
-        'problem': 'mbb_beam_384x64_0.4', #'',
+        'problem': 'mbb_beam_192x64_0.4', #'',
         'opt_steps': 200,
-        'volfrac': 0.4,
+        'volfrac': 0.5,
         'penal_start': None,
         'penal_end': None,
         'penal_power': None,
-        'seed': 1301,
+        'seed': 0,
         # how many designs to create per method (different seeds)
-        'n_designs_per_method': 200,
+        'n_designs_per_method': 400,
         # binarization threshold
         'binarize_threshold': 0.5,
         # if True, only save the left half of the design (mirrored symmetry)

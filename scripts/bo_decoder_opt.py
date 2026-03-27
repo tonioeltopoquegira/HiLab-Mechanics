@@ -44,7 +44,7 @@ from neural_structural_optimization import topo_physics
 CONFIG = {
     "decoder_checkpoint": "models/vitvae_decoder_thaw1_latent16.pt",
     "latent_dim": 16,
-    "bounds": (-10.0, 10.0),
+    "bounds": (-2.0, 2.0),
     "max_trials": 100,
     "sobol_steps": 5,
     "binarize_threshold": 0.5,

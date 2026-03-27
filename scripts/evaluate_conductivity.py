@@ -319,7 +319,7 @@ if __name__ == "__main__":
         _ = evaluate_design_conductivity(imgs[:2], solver_res=64)
 
         # Batched solve timing in chunks (e.g. batch_size = 16)
-        batch_size = 16
+        batch_size = 8
         t0 = time.time()
         all_T = []
         all_k = []
