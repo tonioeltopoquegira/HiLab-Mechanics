@@ -1,0 +1,3 @@
+[submodule "fracture_solver"]
+	path = fracture_solver
+	url = https://github.com/umarkhayaz/Phase-Field-Fracture.git
